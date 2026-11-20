@@ -21,8 +21,8 @@ import { Certificates } from "./pages/Certificates";
 import { AppIds } from "./pages/AppIds";
 import { Settings } from "./pages/Settings";
 import { Pairing } from "./pages/Pairing";
+import { Refresh } from "./pages/Refresh";
 import { getVersion } from "@tauri-apps/api/app";
-import { checkForUpdates } from "./update";
 import logo from "./iloader.svg";
 import { GlassCard } from "./components/GlassCard";
 import { useTranslation } from "react-i18next";
@@ -66,10 +66,6 @@ function App() {
       setVersion(version);
     };
     fetchVersion();
-  }, []);
-
-  useEffect(() => {
-    checkForUpdates();
   }, []);
 
   const shortcutLabel = useCallback(
@@ -395,6 +391,16 @@ function App() {
                   {t("app.import_ipa")}
                 </button>
               </div>
+            </GlassCard>
+          </section>
+          <section className="workspace-section">
+            <p className="section-label">{t("refresh.title")}</p>
+            <GlassCard className="panel">
+              <Refresh
+                ensureReady={() =>
+                  ensuredLoggedIn() && ensureSelectedDevice()
+                }
+              />
             </GlassCard>
           </section>
           <section className="workspace-section">

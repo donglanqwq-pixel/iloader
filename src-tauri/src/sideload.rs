@@ -1,7 +1,16 @@
-use std::{path::PathBuf, sync::Mutex};
+use std::{
+    path::PathBuf,
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use crate::{
-    device::{DeviceInfoMutex, get_provider, get_provider_from_connection, get_usbmuxd},
+    device::{
+        DeviceInfoMutex, DeviceInfoWithPairing, get_provider, get_provider_from_connection,
+        get_usbmuxd,
+    },
     error::AppError,
     operation::Operation,
     pairing::{get_sidestore_info, place_file},
@@ -12,21 +21,45 @@ use isideload::{
 };
 use tauri::{AppHandle, Manager, State, Window};
 
-pub type SideloaderMutex =
-    Mutex<Option<Sideloader<MaxCertsCallbackBox, ExtensionsBehaviorCallbackBox>>>;
+static SIDELOAD_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+pub struct SideloadLock;
+
+impl SideloadLock {
+    pub fn acquire() -> Result<Self, AppError> {
+        if SIDELOAD_ACTIVE.swap(true, Ordering::SeqCst) {
+            return Err(AppError::Misc("Another install is already running".into()));
+        }
+        Ok(Self)
+    }
+}
+
+impl Drop for SideloadLock {
+    fn drop(&mut self) {
+        SIDELOAD_ACTIVE.store(false, Ordering::SeqCst);
+    }
+}
+
+pub type IloaderSideloader =
+    Sideloader<MaxCertsCallbackBox, ExtensionsBehaviorCallbackBox>;
+
+pub type SideloaderMutex = Mutex<Option<IloaderSideloader>>;
 
 pub struct SideloaderGuard<'a> {
     state: &'a SideloaderMutex,
-    sideloader: Option<Sideloader<MaxCertsCallbackBox, ExtensionsBehaviorCallbackBox>>,
+    sideloader: Option<IloaderSideloader>,
+    generation: u64,
 }
 
 impl<'a> SideloaderGuard<'a> {
     pub fn take(state: &'a SideloaderMutex) -> Result<Self, AppError> {
         let mut guard = state.lock().unwrap();
+        let generation = crate::account::session_generation();
         let sideloader = guard.take().ok_or(AppError::NotLoggedIn)?;
         Ok(Self {
             state,
             sideloader: Some(sideloader),
+            generation,
         })
     }
 
@@ -41,8 +74,13 @@ impl<'a> SideloaderGuard<'a> {
 
 impl Drop for SideloaderGuard<'_> {
     fn drop(&mut self) {
+        if self.sideloader.is_none() {
+            return;
+        }
         let mut guard = self.state.lock().unwrap();
-        *guard = self.sideloader.take();
+        if guard.is_none() && crate::account::session_generation() == self.generation {
+            *guard = self.sideloader.take();
+        }
     }
 }
 
@@ -77,20 +115,47 @@ pub async fn sideload(
     Ok(special)
 }
 
+pub async fn sideload_with_device(
+    sideloader: &mut IloaderSideloader,
+    device: &DeviceInfoWithPairing,
+    app_path: PathBuf,
+) -> Result<Option<SpecialApp>, AppError> {
+    let provider = get_provider(&device.info).await?;
+
+    let special = sideloader
+        .install_app(
+            &provider,
+            app_path,
+            true,
+            None::<fn(f32) -> std::future::Ready<()>>,
+            Some(&device.pairing),
+        )
+        .await?;
+
+    Ok(special)
+}
+
 #[tauri::command]
 pub async fn sideload_operation(
+    app: AppHandle,
     window: Window,
     device_state: State<'_, DeviceInfoMutex>,
     sideloader_state: State<'_, SideloaderMutex>,
     app_path: String,
 ) -> Result<(), AppError> {
+    let _lock = SideloadLock::acquire()?;
     let op = Operation::new("sideload".to_string(), &window);
     op.start("install")?;
     op.fail_if_err(
         "install",
-        sideload(device_state, sideloader_state, app_path).await,
+        sideload(device_state, sideloader_state, app_path.clone()).await,
     )?;
     op.complete("install")?;
+
+    if let Err(e) = crate::refresh::remember_ipa(&app, &app_path, true) {
+        tracing::warn!("Failed to add imported IPA to refresh library: {e}");
+    }
+
     Ok(())
 }
 
@@ -103,6 +168,7 @@ pub async fn install_sidestore_operation(
     nightly: bool,
     live_container: bool,
 ) -> Result<(), AppError> {
+    let _lock = SideloadLock::acquire()?;
     let op = Operation::new("install_sidestore".to_string(), &window);
     op.start("download")?;
     // TODO: Cache & check version to avoid re-downloading

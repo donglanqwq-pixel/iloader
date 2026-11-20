@@ -18,6 +18,7 @@ use keyring::Entry;
 use rootcause::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Listener, State, Window};
 use tauri_plugin_store::StoreExt;
@@ -39,8 +40,14 @@ pub async fn login_new(
     anisette_server: String,
     save_credentials: bool,
 ) -> Result<(), AppError> {
+    let generation = next_login_generation();
     let account = login(&handle, window, &email, &password, anisette_server).await?;
     let mut sideloader_guard = sideloader_state.lock().unwrap();
+    if !login_is_current(generation) {
+        return Err(AppError::Misc(
+            "Login was superseded by a newer attempt".into(),
+        ));
+    }
     *sideloader_guard = Some(account);
 
     if save_credentials {
@@ -88,8 +95,14 @@ pub async fn login_stored(
     let password = pass_entry.get_password().map_err(|e| {
         AppError::KeyringWithMessage("Failed to get credentials".to_string(), e.to_string())
     })?;
+    let generation = next_login_generation();
     let account = login(&handle, window, &email, &password, anisette_server).await?;
     let mut sideloader_guard = sideloader_state.lock().unwrap();
+    if !login_is_current(generation) {
+        return Err(AppError::Misc(
+            "Login was superseded by a newer attempt".into(),
+        ));
+    }
     *sideloader_guard = Some(account);
 
     Ok(())
@@ -97,6 +110,7 @@ pub async fn login_stored(
 
 #[tauri::command]
 pub fn delete_account(handle: AppHandle, email: String) -> Result<(), AppError> {
+    LOGIN_GENERATION.fetch_add(1, Ordering::SeqCst);
     let store = handle
         .store("data.json")
         .map_err(|e| AppError::Misc(format!("Failed to get store: {:?}", e)))?;
@@ -130,8 +144,23 @@ pub fn logged_in_as(sideloader_state: State<'_, SideloaderMutex>) -> Option<Stri
 
 #[tauri::command]
 pub fn invalidate_account(sideloader_state: State<'_, SideloaderMutex>) {
+    LOGIN_GENERATION.fetch_add(1, Ordering::SeqCst);
     let mut sideloader_guard = sideloader_state.lock().unwrap();
     *sideloader_guard = None;
+}
+
+static LOGIN_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+fn next_login_generation() -> u64 {
+    LOGIN_GENERATION.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+fn login_is_current(generation: u64) -> bool {
+    LOGIN_GENERATION.load(Ordering::SeqCst) == generation
+}
+
+pub fn session_generation() -> u64 {
+    LOGIN_GENERATION.load(Ordering::SeqCst)
 }
 
 #[tauri::command]
@@ -159,19 +188,22 @@ pub fn reset_anisette_state() -> Result<bool, AppError> {
     }
 }
 
-async fn login(
+async fn authenticate(
     app: &AppHandle,
     window: Window,
     email: &str,
     password: &str,
     anisette_server: String,
-) -> Result<Sideloader<MaxCertsCallbackBox, ExtensionsBehaviorCallbackBox>, AppError> {
+) -> Result<DeveloperSession, AppError> {
     let tfa_closure = {
         let window_clone = window.clone();
         move |params: TwoFactorCallbackParams| {
             let window_clone = window_clone.clone();
 
             async move {
+                let _ = window_clone.show();
+                let _ = window_clone.unminimize();
+                let _ = window_clone.set_focus();
                 window_clone
                     .emit("2fa-required", params)
                     .context("Failed to emit 2fa-required event")?;
@@ -221,6 +253,18 @@ async fn login(
 
     debug!("Created developer session");
 
+    Ok(dev_session)
+}
+
+async fn login(
+    app: &AppHandle,
+    window: Window,
+    email: &str,
+    password: &str,
+    anisette_server: String,
+) -> Result<Sideloader<MaxCertsCallbackBox, ExtensionsBehaviorCallbackBox>, AppError> {
+    let dev_session = authenticate(app, window.clone(), email, password, anisette_server).await?;
+
     let max_certs_callback: MaxCertsCallbackBox =
         Box::new(move |certs: Vec<DevelopmentCertificate>| {
             let window_clone = window.clone();
@@ -235,6 +279,9 @@ async fn login(
                         machine_id: cert.machine_id.clone(),
                     })
                     .collect();
+                let _ = window_clone.show();
+                let _ = window_clone.unminimize();
+                let _ = window_clone.set_focus();
                 window_clone.emit("max-certs-reached", cert_infos)?;
 
                 let (tx, rx) = std::sync::mpsc::channel::<Option<Vec<String>>>();
@@ -262,6 +309,36 @@ async fn login(
         .build();
 
     debug!("Built sideloader");
+
+    Ok(sideloader)
+}
+
+pub async fn login_refresh(
+    app: &AppHandle,
+    window: Window,
+    email: &str,
+    password: &str,
+    anisette_server: String,
+    revoke_certs: bool,
+) -> Result<Sideloader<MaxCertsCallbackBox, ExtensionsBehaviorCallbackBox>, AppError> {
+    let dev_session = authenticate(app, window, email, password, anisette_server).await?;
+
+    let max_certs_behavior: MaxCertsBehavior<MaxCertsCallbackBox> = if revoke_certs {
+        MaxCertsBehavior::Revoke
+    } else {
+        MaxCertsBehavior::Error
+    };
+
+    let sideloader = SideloaderBuilder::new(dev_session, email.to_lowercase())
+        .machine_name("iloader".into())
+        .storage(create_sideloading_storage(app)?)
+        .extensions_behavior(ExtensionsBehaviorSelection::Fixed(
+            ExtensionsBehavior::ReuseMain,
+        ))
+        .max_certs_behavior(max_certs_behavior)
+        .build();
+
+    debug!("Built sideloader for automatic refresh");
 
     Ok(sideloader)
 }

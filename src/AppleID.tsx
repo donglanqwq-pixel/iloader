@@ -11,6 +11,7 @@ import { Certificate } from "./pages/Certificates";
 import { useTranslation } from "react-i18next";
 
 const storePromise = load("data.json");
+const AUTO_LOGIN_TIMEOUT_MS = 30_000;
 
 export const AppleID = ({
   loggedInAs,
@@ -38,20 +39,93 @@ export const AppleID = ({
   const [selectedSerials, setSelectedSerials] = useState<string[]>([]);
   const [chooseCertsOpen, setChooseCertsOpen] = useState<boolean>(false);
   const { err } = useError();
+  const autoLoginTried = useRef(false);
+  const [resolving, setResolving] = useState<boolean>(true);
+  const [autoLoginTarget, setAutoLoginTarget] = useState<string | null>(null);
+
+  const rememberAccount = async (email: string) => {
+    try {
+      const store = await storePromise;
+      await store.set("lastAccount", email);
+      await store.save();
+    } catch (e) {
+      console.debug("Failed to remember account", e);
+    }
+  };
+
+  const forgetAccount = async (email: string) => {
+    try {
+      const store = await storePromise;
+      if ((await store.get<string>("lastAccount")) === email) {
+        await store.delete("lastAccount");
+        await store.save();
+      }
+    } catch (e) {
+      console.debug("Failed to forget account", e);
+    }
+  };
 
   useEffect(() => {
-    let getLoggedInAs = async () => {
-      let account = await invoke<string | null>("logged_in_as");
-      setLoggedInAs(account);
-    };
-    let getStoredIds = async () => {
-      const store = await storePromise;
-      let ids = (await store.get<string[]>("ids")) ?? [];
-      setStoredIds(ids);
+    let initialize = async () => {
+      try {
+        const [account, store] = await Promise.all([
+          invoke<string | null>("logged_in_as"),
+          storePromise,
+        ]);
+        setLoggedInAs(account);
+        let ids = (await store.get<string[]>("ids")) ?? [];
+        setStoredIds(ids);
+
+        if (account) {
+          autoLoginTried.current = true;
+          return;
+        }
+        if (autoLoginTried.current || ids.length === 0) return;
+        autoLoginTried.current = true;
+
+        const lastAccount = await store.get<string>("lastAccount");
+        const target =
+          lastAccount && ids.includes(lastAccount)
+            ? lastAccount
+            : ids.length === 1
+              ? ids[0]
+              : null;
+        if (!target) return;
+
+        setAutoLoginTarget(target);
+        const login = invoke("login_stored", {
+          email: target,
+          anisetteServer,
+        });
+        login.then(
+          () => {
+            setLoggedInAs(target);
+            rememberAccount(target);
+          },
+          () => {},
+        );
+        try {
+          await Promise.race([
+            login,
+            new Promise((_, reject) =>
+              setTimeout(
+                () => reject(new Error("Auto login timed out")),
+                AUTO_LOGIN_TIMEOUT_MS,
+              ),
+            ),
+          ]);
+        } catch (e) {
+          console.debug("Auto login did not finish", e);
+        }
+      } catch (e) {
+        console.debug("Failed to initialize account state", e);
+      } finally {
+        setAutoLoginTarget(null);
+        setResolving(false);
+      }
     };
 
-    getLoggedInAs();
-    getStoredIds();
+    initialize();
   }, [forceUpdateIds]);
 
   useEffect(() => {
@@ -112,6 +186,7 @@ export const AppleID = ({
                 type="button"
                 className="action-button danger"
                 onClick={async () => {
+                  autoLoginTried.current = true;
                   let promise = async () => {
                     await invoke("invalidate_account");
                     setForceUpdateIds((v) => v + 1);
@@ -140,12 +215,14 @@ export const AppleID = ({
                       <button
                         type="button"
                         className="action-button primary"
+                        disabled={resolving}
                         onClick={() => {
                           let promise = async () => {
                             await invoke("login_stored", {
                               email: id,
                               anisetteServer,
                             });
+                            await rememberAccount(id);
                             setForceUpdateIds((v) => v + 1);
                           };
                           toast.promise(promise, {
@@ -155,15 +232,24 @@ export const AppleID = ({
                           });
                         }}
                       >
-                        {t("apple_id.sign_in")}
+                        {autoLoginTarget === id
+                          ? t("apple_id.logging_in")
+                          : t("apple_id.sign_in")}
                       </button>
                     )}
                     <button
                       type="button"
                       className="action-button danger"
+                      disabled={resolving}
                       onClick={async () => {
                         let promise = async () => {
                           await invoke("delete_account", { email: id });
+                          if (loggedInAs === id) {
+                            await invoke("invalidate_account");
+                            autoLoginTried.current = true;
+                            setLoggedInAs(null);
+                          }
+                          await forgetAccount(id);
                           setForceUpdateIds((v) => v + 1);
                         };
                         toast.promise(promise, {
@@ -191,7 +277,7 @@ export const AppleID = ({
             </div>
           </div>
         )}
-        {((loggedInAs === null && storedIds.length === 0) ||
+        {((!resolving && loggedInAs === null && storedIds.length === 0) ||
           addAccountOpen) && (
           <div className="new-login">
             {storedIds.length > 0 && <h3>{t("apple_id.new_login")}</h3>}
@@ -214,6 +300,7 @@ export const AppleID = ({
                     saveCredentials: saveCredentials,
                     anisetteServer,
                   });
+                  await rememberAccount(emailInput);
                   setForceUpdateIds((v) => v + 1);
                 };
                 toast.promise(promise, {

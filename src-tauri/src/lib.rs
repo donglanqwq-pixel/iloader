@@ -11,6 +11,7 @@ mod secure_storage;
 mod error;
 mod logging;
 mod operation;
+mod refresh;
 
 use crate::{
     account::{
@@ -24,21 +25,34 @@ use crate::{
         delete_stored_rppairing, export_pairing_cmd, has_stored_rppairing, installed_pairing_apps,
         place_pairing_cmd,
     },
+    refresh::{
+        autostart_get, autostart_set, refresh_add_ipa, refresh_get_config, refresh_now,
+        refresh_remove_app, refresh_update_settings,
+    },
     secure_storage::{force_disable_keyring, keyring_available},
     sideload::{SideloaderMutex, install_sidestore_operation, sideload_operation},
 };
-use tauri::Manager;
+use tauri::{
+    Manager, WindowEvent,
+    menu::{Menu, MenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+};
 use tracing_subscriber::{Layer, Registry, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let start_hidden = std::env::args().any(|argument| argument == "--hidden");
+
     tauri::Builder::default()
         .plugin(tauri_plugin_process::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec!["--hidden"]),
+        ))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_store::Builder::new().build())
-        .setup(|app| {
+        .setup(move |app| {
             let log_dir = app
                 .path()
                 .app_data_dir()
@@ -101,6 +115,28 @@ pub fn run() {
             app.manage(DeviceInfoMutex::new(None));
             app.manage(SideloaderMutex::new(None));
             app.manage(PairingCancelToken::new(None));
+
+            let window = app
+                .get_webview_window("main")
+                .expect("main window should exist");
+            match setup_tray(app.handle()) {
+                Ok(()) => {
+                    let window_clone = window.clone();
+                    window.on_window_event(move |event| {
+                        if let WindowEvent::CloseRequested { api, .. } = event {
+                            api.prevent_close();
+                            let _ = window_clone.hide();
+                        }
+                    });
+                }
+                Err(error) => tracing::warn!("Failed to create tray icon: {error}"),
+            }
+            if !start_hidden {
+                let _ = window.show();
+            }
+
+            refresh::start_auto_refresh(app.handle().clone());
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -126,7 +162,69 @@ pub fn run() {
             force_disable_keyring,
             cancel_pairing,
             has_stored_rppairing,
+            refresh_get_config,
+            refresh_update_settings,
+            refresh_add_ipa,
+            refresh_remove_app,
+            refresh_now,
+            autostart_get,
+            autostart_set,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(move |app_handle, event| {
+            if start_hidden && matches!(event, tauri::RunEvent::Ready) {
+                if let Some(window) = app_handle.get_webview_window("main") {
+                    let _ = window.hide();
+                }
+            }
+        });
+}
+
+fn setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
+    let open = MenuItem::with_id(app, "open", "Open iloader", true, None::<&str>)?;
+    let refresh = MenuItem::with_id(app, "refresh", "Refresh apps now", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&open, &refresh, &quit])?;
+
+    let mut builder = TrayIconBuilder::new()
+        .tooltip("iloader")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "open" => show_main_window(app),
+            "refresh" => {
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    refresh::trigger_refresh(app).await;
+                });
+            }
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                show_main_window(tray.app_handle());
+            }
+        });
+
+    if let Some(icon) = app.default_window_icon() {
+        builder = builder.icon(icon.clone());
+    }
+    builder.build(app)?;
+
+    Ok(())
+}
+
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
 }
